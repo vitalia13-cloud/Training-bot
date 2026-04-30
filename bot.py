@@ -1,3 +1,5 @@
+bash
+
 cat > /mnt/user-data/outputs/bot.py << 'ENDOFFILE'
 import os
 import logging
@@ -336,3 +338,6 @@ def main():
 if __name__ == "__main__":
     main()
 ENDOFFILE
+Output
+
+exit code 0
