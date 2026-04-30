@@ -1,5 +1,6 @@
 import os
 import logging
+import base64
 from datetime import datetime
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -19,22 +20,6 @@ WEBHOOK_HOST   = os.getenv("WEBHOOK_HOST", "")
 WEBHOOK_PATH   = "/webhook"
 ALLOWED_CHATS  = {c.strip() for c in os.getenv("ALLOWED_CHATS", "").split(",") if c.strip()}
 
-# ── Валідація при старті ──────────────────────────────────────────────────────
-def validate_config():
-    missing = []
-    if not BOT_TOKEN:
-        missing.append("BOT_TOKEN")
-    if not GEMINI_API_KEY:
-        missing.append("GEMINI_API_KEY")
-    if not WEBHOOK_SECRET:
-        missing.append("WEBHOOK_SECRET")
-    if not WEBHOOK_HOST:
-        missing.append("WEBHOOK_HOST")
-    if not ALLOWED_CHATS:
-        missing.append("ALLOWED_CHATS")
-    if missing:
-        raise ValueError(f"Відсутні обов'язкові змінні середовища: {', '.join(missing)}")
-
 # ── Логування ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -42,30 +27,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Gemini клієнт (один раз при старті) ──────────────────────────────────────
+# ── Bot і Dispatcher — ОДРАЗУ ─────────────────────────────────────────────────
+bot = Bot(token=BOT_TOKEN)
+dp  = Dispatcher()
+
+# ── Gemini ────────────────────────────────────────────────────────────────────
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
-# ── Rate limiting (макс 5 запитів на хвилину на юзера) ───────────────────────
-RATE_LIMIT     = 5
-RATE_WINDOW    = 60  # секунд
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+RATE_LIMIT   = 5
+RATE_WINDOW  = 60
 _rate_buckets: dict[int, list[float]] = defaultdict(list)
 
 def is_rate_limited(user_id: int) -> bool:
     now   = time.monotonic()
-    calls = _rate_buckets[user_id]
-    # видаляємо старі дзвінки поза вікном
-    _rate_buckets[user_id] = [t for t in calls if now - t < RATE_WINDOW]
+    _rate_buckets[user_id] = [t for t in _rate_buckets[user_id] if now - t < RATE_WINDOW]
     if len(_rate_buckets[user_id]) >= RATE_LIMIT:
         return True
     _rate_buckets[user_id].append(now)
     return False
 
-# ── Перевірка дозволеного чату ────────────────────────────────────────────────
 def is_allowed(message: Message) -> bool:
     return str(message.chat.id) in ALLOWED_CHATS
 
-# ── Активи ───────────────────────────────────────────────────────────────────
+# ── Активи ────────────────────────────────────────────────────────────────────
 ASSET_EMOJI = {
     "EURUSD": "EU",  "GBPUSD": "GB",  "AUDUSD": "AU",  "NZDUSD": "NZ",
     "USDJPY": "JP",  "EURJPY": "EJ",  "GBPJPY": "GJ",
@@ -75,7 +61,6 @@ ASSET_EMOJI = {
 
 # ── Аналіз графіка ────────────────────────────────────────────────────────────
 async def analyze_chart(image_bytes: bytes) -> str:
-    import base64
     img_part = {
         "mime_type": "image/png",
         "data": base64.b64encode(image_bytes).decode(),
@@ -92,9 +77,6 @@ async def analyze_chart(image_bytes: bytes) -> str:
     return response.text
 
 # ── Команди ───────────────────────────────────────────────────────────────────
-bot = Bot(token=BOT_TOKEN)
-dp  = Dispatcher()
-
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     if not is_allowed(message):
@@ -142,16 +124,12 @@ async def cmd_help(message: Message):
 # ── Обробник фото ─────────────────────────────────────────────────────────────
 @dp.message(F.photo)
 async def handle_photo(message: Message):
-    # 1. Дозволений чат?
     if not is_allowed(message):
         logger.warning("Фото від незнайомого чату %s — ігноруємо", message.chat.id)
         return
-
-    # 2. Rate limit
     if is_rate_limited(message.from_user.id):
         await message.answer("⏳ Забагато запитів. Зачекай хвилину і спробуй знову.")
         return
-
     await message.answer("Аналізую графік... зачекай")
     try:
         photo     = message.photo[-1]
@@ -166,38 +144,27 @@ async def handle_photo(message: Message):
 
 # ── TradingView webhook ───────────────────────────────────────────────────────
 _tv_rate: dict[str, float] = {}
-TV_COOLDOWN = 10  # секунд між однаковими сигналами
+TV_COOLDOWN = 10
 
 async def tradingview_webhook(request: web.Request) -> web.Response:
-    # 1. JSON
     try:
         data = await request.json()
     except Exception:
-        logger.warning("Невалідний JSON від %s", request.remote)
         return web.Response(status=400, text="Invalid JSON")
-
-    # 2. Секрет
     if data.get("secret", "") != WEBHOOK_SECRET:
-        logger.warning("Невірний секрет від %s", request.remote)
         return web.Response(status=403, text="Forbidden")
-
     symbol    = data.get("symbol", "UNKNOWN").upper()
     action    = data.get("action", "").upper()
     price     = data.get("price", "N/A")
     timeframe = data.get("timeframe", "")
-
-    # 3. Захист від дублів
     key = f"{symbol}:{action}"
     now = time.monotonic()
     if now - _tv_rate.get(key, 0) < TV_COOLDOWN:
-        logger.info("Дубльований сигнал %s — пропускаємо", key)
         return web.Response(text="OK")
     _tv_rate[key] = now
-
     code        = ASSET_EMOJI.get(symbol, "")
     action_text = "КУПИТИ" if action == "BUY" else "ПРОДАТИ" if action == "SELL" else action
     ts          = datetime.now().strftime("%d.%m.%Y %H:%M")
-
     signal = (
         f"НОВИЙ СИГНАЛ — {ts}\n\n"
         f"{code} {symbol}\n"
@@ -206,15 +173,11 @@ async def tradingview_webhook(request: web.Request) -> web.Response:
         f"Таймфрейм: {timeframe}\n\n"
         f"Це не фінансова порада."
     )
-
-    logger.info("Сигнал: %s %s @ %s (%s)", symbol, action, price, timeframe)
-
     for chat_id in ALLOWED_CHATS:
         try:
             await bot.send_message(chat_id, signal)
         except Exception:
             logger.exception("Не вдалось надіслати сигнал у чат %s", chat_id)
-
     return web.Response(text="OK")
 
 # ── Старт / стоп ──────────────────────────────────────────────────────────────
@@ -229,17 +192,12 @@ async def on_shutdown(app: web.Application):
 
 # ── Точка входу ───────────────────────────────────────────────────────────────
 def main():
-    validate_config()
-
     app = web.Application()
     app.router.add_post("/tradingview", tradingview_webhook)
-
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
-
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
-
     logger.info("Запуск на порту %s", PORT)
     web.run_app(app, host="0.0.0.0", port=PORT)
 
