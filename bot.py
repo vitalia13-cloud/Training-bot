@@ -299,29 +299,43 @@ async def get_all_mtf() -> dict:
         await asyncio.sleep(0.2)
     return results
 
+def smart_price(sym: str, price: float) -> str:
+    """Форматує ціну розумно — менше зайвих цифр"""
+    if sym in ("XAUUSD", "GER40", "NAS100", "US30", "BTCUSD"):
+        return f"{price:,.2f}".replace(",", " ")
+    elif sym in ("USDJPY", "EURJPY", "GBPJPY"):
+        return f"{price:.3f}"
+    else:
+        return f"{price:.5f}"
+
 def format_mtf(mtf_data: dict) -> str:
     ASSET_FLAGS = {
         "EURUSD": "🇪🇺", "GBPUSD": "🇬🇧", "AUDUSD": "🇦🇺", "NZDUSD": "🇳🇿",
         "USDJPY": "🇯🇵", "EURJPY": "🔀", "GBPJPY": "🔀",
         "XAUUSD": "🥇", "BTCUSD": "₿", "GER40": "🇩🇪", "NAS100": "💻", "US30": "🏦",
     }
+    SIGNAL_ICONS = {"ЛОНГ": "🟢", "ШОРТ": "🔴", "НЕЙТР": "⚪"}
     lines = []
     ts = datetime.now().strftime("%d.%m.%Y %H:%M")
-    lines.append(f"📊 MTF АНАЛІЗ — {ts}")
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"📊 MTF — {ts}")
+    lines.append("─" * 22)
     for sym, tfs in mtf_data.items():
         flag = ASSET_FLAGS.get(sym, "")
         source = tfs.get("1H", tfs.get("1D", {})).get("source", "")
-        lines.append(f"\n{flag} {sym}  {source}")
+        # Ціна з 1H або 1D
+        price_tf = tfs.get("1H") or tfs.get("1D") or {}
+        price_str = smart_price(sym, price_tf["price"]) if price_tf else "—"
+        lines.append(f"\n{flag} {sym}  {price_str}  {source}")
+        # Один рядок: 1D | 4H | 1H
+        row = []
         for tf_label in ["1D", "4H", "1H"]:
             if tf_label in tfs:
                 d = tfs[tf_label]
-                lines.append(
-                    f"  {tf_label}: {d['trend']} {d['direction']}  "
-                    f"{d['price']}  H:{d['high']} L:{d['low']}"
-                )
-    lines.append("\n━━━━━━━━━━━━━━━━━━━━")
-    lines.append("🟢RT = реальний час  🕐15хв = затримка 15хв")
+                icon = SIGNAL_ICONS.get(d["direction"], "⚪")
+                row.append(f"{tf_label} {icon} {d['direction']}")
+        lines.append("  " + "   ".join(row))
+    lines.append("\n─" * 11)
+    lines.append("🟢 ЛОНГ = зростання  🔴 ШОРТ = падіння  ⚪ НЕЙТР")
     lines.append("⚠️ Це не фінансова порада.")
     return "\n".join(lines)
 
