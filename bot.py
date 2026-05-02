@@ -200,92 +200,132 @@ POLYGON_TF = {
 }
 
 async def get_polygon_mtf(symbol: str) -> dict:
-    """MTF через Polygon для крипто — реальний час"""
+    """MTF через Polygon для крипто — реальний час з обсягами"""
     from datetime import timedelta, date
     ticker = POLYGON_CRYPTO.get(symbol)
     if not ticker:
         return {}
     result = {}
     today = date.today()
-    from_date = (today - timedelta(days=10)).isoformat()
+    from_date = (today - timedelta(days=30)).isoformat()
     to_date = today.isoformat()
     for tf_label, (mult, span) in POLYGON_TF.items():
         url = (
             f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/{mult}/{span}/"
-            f"{from_date}/{to_date}?adjusted=true&sort=desc&limit=5&apiKey={POLYGON_API_KEY}"
+            f"{from_date}/{to_date}?adjusted=true&sort=desc&limit=20&apiKey={POLYGON_API_KEY}"
         )
         try:
             async with aiohttp_client.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp_client.ClientTimeout(total=8)) as resp:
+                async with session.get(url, timeout=aiohttp_client.ClientTimeout(total=10)) as resp:
                     data = await resp.json()
-                    results = data.get("results", [])
-                    if len(results) >= 2:
-                        curr = results[0]
-                        prev = results[1]
-                        close = float(curr["c"])
-                        open_ = float(curr["o"])
+                    bars = data.get("results", [])
+                    if len(bars) >= 5:
+                        curr = bars[0]
+                        prev = bars[1]
+                        close  = float(curr["c"])
+                        open_  = float(curr["o"])
+                        high   = float(curr["h"])
+                        low    = float(curr["l"])
+                        volume = float(curr.get("v", 0))
                         prev_close = float(prev["c"])
+
+                        # ATR по останніх 5 барах
+                        atr = sum(float(b["h"]) - float(b["l"]) for b in bars[:5]) / 5
+
+                        # Середній обсяг
+                        avg_vol = sum(float(b.get("v", 0)) for b in bars[1:11]) / 10
+                        vol_ratio = volume / avg_vol if avg_vol > 0 else 1.0
+
+                        # Рівні підтримки/опору з останніх 10 барів
+                        recent_highs = sorted([float(b["h"]) for b in bars[1:11]], reverse=True)
+                        recent_lows  = sorted([float(b["l"]) for b in bars[1:11]])
+                        resistance = recent_highs[0]
+                        support    = recent_lows[0]
+
+                        # Напрямок
                         if close > open_ and close > prev_close:
                             trend, direction = "📈", "ЛОНГ"
                         elif close < open_ and close < prev_close:
                             trend, direction = "📉", "ШОРТ"
                         else:
                             trend, direction = "➡️", "НЕЙТР"
+
                         result[tf_label] = {
-                            "price": round(close, 2),
-                            "trend": trend,
-                            "direction": direction,
-                            "high": round(float(curr["h"]), 2),
-                            "low":  round(float(curr["l"]), 2),
-                            "source": "🟢RT",
+                            "price":      round(close, 2),
+                            "open":       round(open_, 2),
+                            "high":       round(high, 2),
+                            "low":        round(low, 2),
+                            "trend":      trend,
+                            "direction":  direction,
+                            "atr":        round(atr, 2),
+                            "support":    round(support, 2),
+                            "resistance": round(resistance, 2),
+                            "volume":     round(volume, 0),
+                            "vol_ratio":  round(vol_ratio, 2),
+                            "source":     "🟢RT",
                         }
         except Exception:
             logger.warning("Polygon MTF помилка %s %s", symbol, tf_label)
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.2)
     return result
 
 async def get_mtf_data(symbol: str) -> dict:
     """MTF: Polygon для крипто (реальний час), Twelve Data для решти (15хв)"""
-    # Крипто — через Polygon
     if symbol in POLYGON_CRYPTO:
         return await get_polygon_mtf(symbol)
-    # Форекс і індекси — через Twelve Data
     td_sym = TWELVE_SYMBOLS.get(symbol, symbol)
     timeframes = {"1day": "1D", "4h": "4H", "1h": "1H"}
     result = {}
     for tf, label in timeframes.items():
         url = (
             f"https://api.twelvedata.com/time_series?"
-            f"symbol={td_sym}&interval={tf}&outputsize=3&apikey={TWELVE_API_KEY}"
+            f"symbol={td_sym}&interval={tf}&outputsize=20&apikey={TWELVE_API_KEY}"
         )
         try:
             async with aiohttp_client.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp_client.ClientTimeout(total=8)) as resp:
+                async with session.get(url, timeout=aiohttp_client.ClientTimeout(total=10)) as resp:
                     data = await resp.json()
                     values = data.get("values", [])
-                    if len(values) >= 2:
+                    if len(values) >= 5:
                         curr = values[0]
                         prev = values[1]
-                        close = float(curr["close"])
-                        open_ = float(curr["open"])
+                        close  = float(curr["close"])
+                        open_  = float(curr["open"])
+                        high   = float(curr["high"])
+                        low    = float(curr["low"])
                         prev_close = float(prev["close"])
+
+                        # ATR
+                        atr = sum(float(b["high"]) - float(b["low"]) for b in values[:5]) / 5
+
+                        # Рівні з останніх 10 барів
+                        recent_highs = sorted([float(b["high"]) for b in values[1:11]], reverse=True)
+                        recent_lows  = sorted([float(b["low"])  for b in values[1:11]])
+                        resistance = recent_highs[0]
+                        support    = recent_lows[0]
+
                         if close > open_ and close > prev_close:
                             trend, direction = "📈", "ЛОНГ"
                         elif close < open_ and close < prev_close:
                             trend, direction = "📉", "ШОРТ"
                         else:
                             trend, direction = "➡️", "НЕЙТР"
+
                         result[label] = {
-                            "price": close,
-                            "trend": trend,
-                            "direction": direction,
-                            "high": float(curr["high"]),
-                            "low":  float(curr["low"]),
-                            "source": "🕐15хв",
+                            "price":      close,
+                            "open":       open_,
+                            "high":       high,
+                            "low":        low,
+                            "trend":      trend,
+                            "direction":  direction,
+                            "atr":        atr,
+                            "support":    support,
+                            "resistance": resistance,
+                            "source":     "🕐15хв",
                         }
         except Exception:
             logger.warning("MTF помилка %s %s", symbol, tf)
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.15)
     return result
 
 async def get_all_mtf() -> dict:
@@ -300,13 +340,33 @@ async def get_all_mtf() -> dict:
     return results
 
 def smart_price(sym: str, price: float) -> str:
-    """Форматує ціну розумно — менше зайвих цифр"""
-    if sym in ("XAUUSD", "GER40", "NAS100", "US30", "BTCUSD"):
-        return f"{price:,.2f}".replace(",", " ")
+    if sym in ("XAUUSD", "GER40", "NAS100", "US30"):
+        return f"{price:,.0f}".replace(",", " ")
+    elif sym == "BTCUSD":
+        return f"{price:,.0f}".replace(",", " ")
     elif sym in ("USDJPY", "EURJPY", "GBPJPY"):
         return f"{price:.3f}"
     else:
         return f"{price:.5f}"
+
+def calc_levels(sym: str, direction: str, price: float, atr: float, support: float, resistance: float) -> dict:
+    """Розраховує вхід, стоп і тейк на основі ATR і рівнів"""
+    if direction == "ЛОНГ":
+        entry  = price
+        stop   = max(price - atr * 1.2, support - atr * 0.3)
+        target = min(price + atr * 2.0, resistance + atr * 0.3)
+    elif direction == "ШОРТ":
+        entry  = price
+        stop   = min(price + atr * 1.2, resistance + atr * 0.3)
+        target = max(price - atr * 2.0, support - atr * 0.3)
+    else:
+        return {}
+    return {
+        "entry":  entry,
+        "stop":   stop,
+        "target": target,
+        "rr":     round(abs(target - entry) / abs(stop - entry), 1) if abs(stop - entry) > 0 else 0,
+    }
 
 def format_mtf(mtf_data: dict) -> str:
     ASSET_FLAGS = {
@@ -318,25 +378,68 @@ def format_mtf(mtf_data: dict) -> str:
     lines = []
     ts = datetime.now().strftime("%d.%m.%Y %H:%M")
     lines.append(f"📊 MTF — {ts}")
-    lines.append("─" * 22)
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+
     for sym, tfs in mtf_data.items():
-        flag = ASSET_FLAGS.get(sym, "")
+        # Пропускаємо якщо немає жодного таймфрейму
+        available = [tf for tf in ["1D", "4H", "1H"] if tf in tfs]
+        if not available:
+            continue
+
+        flag   = ASSET_FLAGS.get(sym, "")
         source = tfs.get("1H", tfs.get("1D", {})).get("source", "")
-        # Ціна з 1H або 1D
-        price_tf = tfs.get("1H") or tfs.get("1D") or {}
-        price_str = smart_price(sym, price_tf["price"]) if price_tf else "—"
+        best_tf = tfs.get("1H") or tfs.get("4H") or tfs.get("1D")
+        price_str = smart_price(sym, best_tf["price"])
+
         lines.append(f"\n{flag} {sym}  {price_str}  {source}")
-        # Один рядок: 1D | 4H | 1H
+
+        # Таймфрейми в один рядок
         row = []
         for tf_label in ["1D", "4H", "1H"]:
             if tf_label in tfs:
                 d = tfs[tf_label]
                 icon = SIGNAL_ICONS.get(d["direction"], "⚪")
-                row.append(f"{tf_label} {icon} {d['direction']}")
-        lines.append("  " + "   ".join(row))
-    lines.append("\n─" * 11)
-    lines.append("🟢 ЛОНГ = зростання  🔴 ШОРТ = падіння  ⚪ НЕЙТР")
-    lines.append("⚠️ Це не фінансова порада.")
+                row.append(f"{tf_label}{icon}")
+        lines.append("  " + "  ".join(row))
+
+        # Визначаємо загальний напрямок — більшість виграє
+        directions = [tfs[tf]["direction"] for tf in available]
+        long_count  = directions.count("ЛОНГ")
+        short_count = directions.count("ШОРТ")
+
+        if long_count >= 2:
+            overall = "ЛОНГ"
+        elif short_count >= 2:
+            overall = "ШОРТ"
+        else:
+            overall = "НЕЙТР"
+
+        if overall != "НЕЙТР" and "atr" in best_tf:
+            levels = calc_levels(
+                sym, overall,
+                best_tf["price"],
+                best_tf["atr"],
+                best_tf.get("support", best_tf["price"] * 0.99),
+                best_tf.get("resistance", best_tf["price"] * 1.01),
+            )
+            if levels:
+                icon = SIGNAL_ICONS[overall]
+                lines.append(f"  {icon} {overall}")
+                lines.append(f"  🎯 Вхід:  {smart_price(sym, levels['entry'])}")
+                lines.append(f"  🛑 Стоп:  {smart_price(sym, levels['stop'])}")
+                lines.append(f"  💰 Тейк:  {smart_price(sym, levels['target'])}")
+                lines.append(f"  ⚖️ R/R:   1:{levels['rr']}")
+
+                # Обсяг для крипто
+                vol = best_tf.get("vol_ratio")
+                if vol is not None:
+                    vol_str = "🔥 Підвищений" if vol > 1.3 else "📉 Знижений" if vol < 0.7 else "Нормальний"
+                    lines.append(f"  📊 Обсяг: {vol_str} (x{vol})")
+        else:
+            lines.append(f"  ⚪ Немає чіткого сигналу")
+
+    lines.append("\n━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("🟢 ЛОНГ  🔴 ШОРТ  ⚪ НЕЙТР   ⚠️ Не фін. порада")
     return "\n".join(lines)
 
 async def ask_groq(user_id: int, user_message: str, extra_context: str = "") -> str:
