@@ -16,6 +16,7 @@ BOT_TOKEN        = os.getenv("BOT_TOKEN", "")
 GROQ_API_KEY     = os.getenv("GROQ_API_KEY", "")
 TWELVE_API_KEY   = os.getenv("TWELVE_API_KEY", "")
 NEWS_API_KEY     = os.getenv("NEWS_API_KEY", "")
+POLYGON_API_KEY  = os.getenv("POLYGON_API_KEY", "")
 WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET", "")
 PORT             = int(os.getenv("PORT", 8080))
 WEBHOOK_HOST     = os.getenv("WEBHOOK_HOST", "")
@@ -185,6 +186,145 @@ def format_prices_context(prices: dict) -> str:
         lines.append(f"{sym}: {d.get('price', 'N/A')} {arrow}")
     return "\n".join(lines)
 
+# Polygon тікери для крипто (реальний час)
+POLYGON_CRYPTO = {
+    "BTCUSD": "X:BTCUSD",
+    "ETHUSD": "X:ETHUSD",
+}
+
+# Polygon мультиплікатори для таймфреймів
+POLYGON_TF = {
+    "1D":  ("1", "day"),
+    "4H":  ("4", "hour"),
+    "1H":  ("1", "hour"),
+}
+
+async def get_polygon_mtf(symbol: str) -> dict:
+    """MTF через Polygon для крипто — реальний час"""
+    from datetime import timedelta, date
+    ticker = POLYGON_CRYPTO.get(symbol)
+    if not ticker:
+        return {}
+    result = {}
+    today = date.today()
+    from_date = (today - timedelta(days=10)).isoformat()
+    to_date = today.isoformat()
+    for tf_label, (mult, span) in POLYGON_TF.items():
+        url = (
+            f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/{mult}/{span}/"
+            f"{from_date}/{to_date}?adjusted=true&sort=desc&limit=5&apiKey={POLYGON_API_KEY}"
+        )
+        try:
+            async with aiohttp_client.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp_client.ClientTimeout(total=8)) as resp:
+                    data = await resp.json()
+                    results = data.get("results", [])
+                    if len(results) >= 2:
+                        curr = results[0]
+                        prev = results[1]
+                        close = float(curr["c"])
+                        open_ = float(curr["o"])
+                        prev_close = float(prev["c"])
+                        if close > open_ and close > prev_close:
+                            trend, direction = "📈", "ЛОНГ"
+                        elif close < open_ and close < prev_close:
+                            trend, direction = "📉", "ШОРТ"
+                        else:
+                            trend, direction = "➡️", "НЕЙТР"
+                        result[tf_label] = {
+                            "price": round(close, 2),
+                            "trend": trend,
+                            "direction": direction,
+                            "high": round(float(curr["h"]), 2),
+                            "low":  round(float(curr["l"]), 2),
+                            "source": "🟢RT",
+                        }
+        except Exception:
+            logger.warning("Polygon MTF помилка %s %s", symbol, tf_label)
+        await asyncio.sleep(0.1)
+    return result
+
+async def get_mtf_data(symbol: str) -> dict:
+    """MTF: Polygon для крипто (реальний час), Twelve Data для решти (15хв)"""
+    # Крипто — через Polygon
+    if symbol in POLYGON_CRYPTO:
+        return await get_polygon_mtf(symbol)
+    # Форекс і індекси — через Twelve Data
+    td_sym = TWELVE_SYMBOLS.get(symbol, symbol)
+    timeframes = {"1day": "1D", "4h": "4H", "1h": "1H"}
+    result = {}
+    for tf, label in timeframes.items():
+        url = (
+            f"https://api.twelvedata.com/time_series?"
+            f"symbol={td_sym}&interval={tf}&outputsize=3&apikey={TWELVE_API_KEY}"
+        )
+        try:
+            async with aiohttp_client.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp_client.ClientTimeout(total=8)) as resp:
+                    data = await resp.json()
+                    values = data.get("values", [])
+                    if len(values) >= 2:
+                        curr = values[0]
+                        prev = values[1]
+                        close = float(curr["close"])
+                        open_ = float(curr["open"])
+                        prev_close = float(prev["close"])
+                        if close > open_ and close > prev_close:
+                            trend, direction = "📈", "ЛОНГ"
+                        elif close < open_ and close < prev_close:
+                            trend, direction = "📉", "ШОРТ"
+                        else:
+                            trend, direction = "➡️", "НЕЙТР"
+                        result[label] = {
+                            "price": close,
+                            "trend": trend,
+                            "direction": direction,
+                            "high": float(curr["high"]),
+                            "low":  float(curr["low"]),
+                            "source": "🕐15хв",
+                        }
+        except Exception:
+            logger.warning("MTF помилка %s %s", symbol, tf)
+        await asyncio.sleep(0.1)
+    return result
+
+async def get_all_mtf() -> dict:
+    """MTF для всіх основних активів"""
+    main_symbols = ["EURUSD", "GBPUSD", "XAUUSD", "BTCUSD", "NAS100", "US30"]
+    results = {}
+    for sym in main_symbols:
+        data = await get_mtf_data(sym)
+        if data:
+            results[sym] = data
+        await asyncio.sleep(0.2)
+    return results
+
+def format_mtf(mtf_data: dict) -> str:
+    ASSET_FLAGS = {
+        "EURUSD": "🇪🇺", "GBPUSD": "🇬🇧", "AUDUSD": "🇦🇺", "NZDUSD": "🇳🇿",
+        "USDJPY": "🇯🇵", "EURJPY": "🔀", "GBPJPY": "🔀",
+        "XAUUSD": "🥇", "BTCUSD": "₿", "GER40": "🇩🇪", "NAS100": "💻", "US30": "🏦",
+    }
+    lines = []
+    ts = datetime.now().strftime("%d.%m.%Y %H:%M")
+    lines.append(f"📊 MTF АНАЛІЗ — {ts}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    for sym, tfs in mtf_data.items():
+        flag = ASSET_FLAGS.get(sym, "")
+        source = tfs.get("1H", tfs.get("1D", {})).get("source", "")
+        lines.append(f"\n{flag} {sym}  {source}")
+        for tf_label in ["1D", "4H", "1H"]:
+            if tf_label in tfs:
+                d = tfs[tf_label]
+                lines.append(
+                    f"  {tf_label}: {d['trend']} {d['direction']}  "
+                    f"{d['price']}  H:{d['high']} L:{d['low']}"
+                )
+    lines.append("\n━━━━━━━━━━━━━━━━━━━━")
+    lines.append("🟢RT = реальний час  🕐15хв = затримка 15хв")
+    lines.append("⚠️ Це не фінансова порада.")
+    return "\n".join(lines)
+
 async def ask_groq(user_id: int, user_message: str, extra_context: str = "") -> str:
     history = _chat_history[user_id]
     content = f"{extra_context}\n\nПитання: {user_message}" if extra_context else user_message
@@ -258,6 +398,17 @@ async def send_session_report(session: str):
     _session_buffer.pop(session, None)
     _session_timers.pop(session, None)
 
+@dp.message(Command("mtf"))
+async def cmd_mtf(message: Message):
+    if not is_allowed(message):
+        return
+    await message.answer("⏳ Завантажую MTF аналіз...")
+    mtf_data = await get_all_mtf()
+    if not mtf_data:
+        await message.answer("❌ Не вдалось отримати дані.")
+        return
+    await message.answer(format_mtf(mtf_data))
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     if not is_allowed(message):
@@ -266,6 +417,7 @@ async def cmd_start(message: Message):
     await message.answer(
         "👋 Привіт! Я Trading Bot\n\n"
         "📌 Команди:\n"
+        "/mtf — аналіз 1D/4H/1H по активах\n"
         "/prices — реальні ціни\n"
         "/analyze — аналіз з новинами\n"
         "/news — останні новини\n"
