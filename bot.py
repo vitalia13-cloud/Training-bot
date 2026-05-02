@@ -9,6 +9,7 @@ from aiohttp import web
 from collections import defaultdict
 import time
 import asyncio
+import yfinance as yf
 from groq import Groq
 
 # ── Конфігурація ──────────────────────────────────────────────────────────────
@@ -25,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
-
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 RATE_LIMIT  = 5
@@ -43,6 +43,22 @@ def is_rate_limited(user_id: int) -> bool:
 def is_allowed(message: Message) -> bool:
     return str(message.chat.id) in ALLOWED_CHATS
 
+# ── Yahoo Finance тікери ───────────────────────────────────────────────────────
+YAHOO_TICKERS = {
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X",
+    "AUDUSD": "AUDUSD=X",
+    "NZDUSD": "NZDUSD=X",
+    "USDJPY": "USDJPY=X",
+    "EURJPY": "EURJPY=X",
+    "GBPJPY": "GBPJPY=X",
+    "XAUUSD": "GC=F",
+    "BTCUSD": "BTC-USD",
+    "GER40":  "^GDAXI",
+    "NAS100": "NQ=F",
+    "US30":   "YM=F",
+}
+
 ASSET_EMOJI = {
     "EURUSD": "EU", "GBPUSD": "GB", "AUDUSD": "AU", "NZDUSD": "NZ",
     "USDJPY": "JP", "EURJPY": "EJ", "GBPJPY": "GJ",
@@ -58,21 +74,59 @@ SESSION_NAMES = {
 
 _session_buffer: dict[str, dict] = defaultdict(dict)
 _session_timers: dict[str, asyncio.Task] = {}
-
-# Історія чату для кожного користувача
 _chat_history: dict[int, list] = defaultdict(list)
 MAX_HISTORY = 20
 
-SYSTEM_PROMPT = """Ти досвідчений трейдер і фінансовий аналітик. 
-Ти допомагаєш трейдеру аналізувати ринки, відповідаєш на питання про торгівлю, 
-технічний аналіз, фундаментальний аналіз та ринкові тренди.
+SYSTEM_PROMPT = """Ти досвідчений трейдер і фінансовий аналітик для інтрадей торгівлі.
+Ти аналізуєш реальні ринкові дані які тобі надаються і даєш конкретні рекомендації.
 Активи: EURUSD, GBPUSD, XAUUSD, BTCUSD, GER40, NAS100, US30.
-Відповідай завжди українською мовою, коротко і по суті.
+Відповідай завжди українською мовою, коротко і конкретно.
 Завжди додавай: "Це не фінансова порада." в кінці торгових рекомендацій."""
 
-async def ask_groq(user_id: int, user_message: str) -> str:
+# ── Отримання реальних цін ────────────────────────────────────────────────────
+def get_real_prices(symbols: list[str] = None) -> dict:
+    if symbols is None:
+        symbols = list(YAHOO_TICKERS.keys())
+    prices = {}
+    for symbol in symbols:
+        ticker = YAHOO_TICKERS.get(symbol)
+        if not ticker:
+            continue
+        try:
+            data = yf.Ticker(ticker)
+            hist = data.history(period="2d", interval="5m")
+            if not hist.empty:
+                last = hist.iloc[-1]
+                prev_close = hist.iloc[-2]["Close"] if len(hist) > 1 else last["Close"]
+                change_pct = ((last["Close"] - prev_close) / prev_close * 100)
+                prices[symbol] = {
+                    "price": round(last["Close"], 5),
+                    "open": round(last["Open"], 5),
+                    "high": round(last["High"], 5),
+                    "low": round(last["Low"], 5),
+                    "change": round(change_pct, 3),
+                }
+        except Exception as e:
+            logger.warning("Не вдалось отримати ціну %s: %s", symbol, e)
+    return prices
+
+def format_prices(prices: dict) -> str:
+    lines = []
+    for symbol, data in prices.items():
+        arrow = "▲" if data["change"] >= 0 else "▼"
+        lines.append(
+            f"{ASSET_EMOJI.get(symbol, '')} {symbol}: {data['price']} "
+            f"{arrow}{abs(data['change'])}% | H:{data['high']} L:{data['low']}"
+        )
+    return "\n".join(lines)
+
+# ── Groq запит ────────────────────────────────────────────────────────────────
+async def ask_groq(user_id: int, user_message: str, extra_context: str = "") -> str:
     history = _chat_history[user_id]
-    history.append({"role": "user", "content": user_message})
+    content = user_message
+    if extra_context:
+        content = f"{extra_context}\n\nПитання: {user_message}"
+    history.append({"role": "user", "content": content})
     if len(history) > MAX_HISTORY:
         history = history[-MAX_HISTORY:]
         _chat_history[user_id] = history
@@ -87,29 +141,30 @@ async def ask_groq(user_id: int, user_message: str) -> str:
         reply = response.choices[0].message.content
         history.append({"role": "assistant", "content": reply})
         return reply
-    except Exception as e:
+    except Exception:
         logger.exception("Groq помилка")
         return "Помилка запиту. Спробуй ще раз."
 
+# ── Сесійний звіт ─────────────────────────────────────────────────────────────
 async def send_session_report(session: str):
-    buffer = _session_buffer.get(session, {})
-    if not buffer:
-        return
     session_name = SESSION_NAMES.get(session, session.upper())
     ts = datetime.now().strftime("%d.%m.%Y %H:%M")
-    assets_info = "\n".join(
-        f"- {symbol}: ціна {data['price']}, таймфрейм {data['timeframe']}"
-        for symbol, data in buffer.items()
-    )
+
+    await bot.send_message(list(ALLOWED_CHATS)[0], f"Збираю реальні ціни для {session_name}...")
+
+    prices = get_real_prices()
+    prices_text = format_prices(prices)
+
     prompt = (
         f"Зараз починається {session_name}.\n"
-        f"Поточні ціни активів:\n{assets_info}\n\n"
-        "Зроби короткий аналіз:\n"
+        f"Реальні ринкові дані:\n{prices_text}\n\n"
+        "Зроби аналіз для інтрадей торгівлі:\n"
         "1. Загальний настрій ринку\n"
-        "2. Топ-3 активи з найбільшим потенціалом\n"
-        "3. Для кожного: напрямок BUY/SELL, ключові рівні, впевненість\n"
-        "4. Загальна рекомендація на сесію"
+        "2. Топ-3 активи з найбільшим потенціалом прямо зараз\n"
+        "3. Для кожного: напрямок BUY/SELL, точка входу, стоп-лос, тейк-профіт\n"
+        "4. На що звернути особливу увагу сьогодні"
     )
+
     try:
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -120,7 +175,12 @@ async def send_session_report(session: str):
             max_tokens=1024,
         )
         analysis = response.choices[0].message.content
-        report = f"АНАЛІЗ ПЕРЕД СЕСІЄЮ\n{session_name} - {ts}\n\n{analysis}"
+        report = (
+            f"АНАЛІЗ ПЕРЕД СЕСІЄЮ\n"
+            f"{session_name} - {ts}\n\n"
+            f"Поточні ціни:\n{prices_text}\n\n"
+            f"{analysis}"
+        )
         for chat_id in ALLOWED_CHATS:
             try:
                 await bot.send_message(chat_id, report)
@@ -128,9 +188,11 @@ async def send_session_report(session: str):
                 logger.exception("Не вдалось надіслати звіт у чат %s", chat_id)
     except Exception:
         logger.exception("Помилка генерації сесійного звіту")
+
     _session_buffer.pop(session, None)
     _session_timers.pop(session, None)
 
+# ── Команди ───────────────────────────────────────────────────────────────────
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     if not is_allowed(message):
@@ -139,18 +201,51 @@ async def cmd_start(message: Message):
     await message.answer(
         "Привіт! Я Trading Signal Bot\n\n"
         "Що я вмію:\n"
-        "- Відповідаю на питання про ринок і торгівлю\n"
-        "- Авто-сигнали з TradingView\n"
-        "- Аналіз перед сесіями (Азія/Європа/Америка)\n\n"
-        "Активи: EUR, GBP, XAU, BTC, GER40, NAS100, US30\n\n"
+        "- Відповідаю на питання про ринок\n"
+        "- Показую реальні ціни активів\n"
+        "- Аналіз перед сесіями з реальними даними\n"
+        "- Авто-сигнали з TradingView\n\n"
         "Команди:\n"
         "/start — меню\n"
+        "/prices — реальні ціни зараз\n"
+        "/analyze — аналіз ринку зараз\n"
         "/assets — список активів\n"
         "/sessions — розклад сесій\n"
         "/help — як підключити TradingView\n"
-        "/clear — очистити історію чату\n\n"
-        "Просто пиши своє питання про ринок!"
+        "/clear — очистити чат\n\n"
+        "Або просто пиши питання про ринок!"
     )
+
+@dp.message(Command("prices"))
+async def cmd_prices(message: Message):
+    if not is_allowed(message):
+        return
+    await message.answer("Отримую реальні ціни...")
+    prices = get_real_prices()
+    if not prices:
+        await message.answer("Не вдалось отримати ціни. Спробуй пізніше.")
+        return
+    ts = datetime.now().strftime("%d.%m.%Y %H:%M")
+    text = f"Реальні ціни — {ts}\n\n{format_prices(prices)}"
+    await message.answer(text)
+
+@dp.message(Command("analyze"))
+async def cmd_analyze(message: Message):
+    if not is_allowed(message):
+        return
+    await message.answer("Аналізую ринок з реальними даними...")
+    prices = get_real_prices()
+    prices_text = format_prices(prices)
+    ts = datetime.now().strftime("%d.%m.%Y %H:%M")
+    prompt = (
+        f"Реальні ринкові дані на {ts}:\n{prices_text}\n\n"
+        "Дай короткий аналіз для інтрадей торгівлі:\n"
+        "1. Загальний настрій ринку\n"
+        "2. Топ-3 найкращих можливості прямо зараз\n"
+        "3. Для кожної: напрямок, вхід, стоп, тейк"
+    )
+    reply = await ask_groq(message.from_user.id, prompt)
+    await message.answer(f"Аналіз ринку — {ts}\n\n{reply}")
 
 @dp.message(Command("clear"))
 async def cmd_clear(message: Message):
@@ -168,7 +263,7 @@ async def cmd_sessions(message: Message):
         "Азійська:     02:00 — 10:00\n"
         "Європейська:  10:00 — 18:00\n"
         "Американська: 16:30 — 23:00\n\n"
-        "Бот надсилає аналіз за 15 хв до початку кожної сесії.\n"
+        "Бот надсилає аналіз з реальними цінами перед кожною сесією.\n"
         "Налаштуй alerts у TradingView — /help"
     )
 
@@ -206,9 +301,14 @@ async def handle_text(message: Message):
         await message.answer("Забагато запитів. Зачекай хвилину.")
         return
     await message.answer("Думаю...")
-    reply = await ask_groq(message.from_user.id, message.text)
+    # Підтягуємо реальні ціни для контексту
+    prices = get_real_prices()
+    prices_text = format_prices(prices) if prices else ""
+    context = f"Поточні реальні ринкові дані:\n{prices_text}" if prices_text else ""
+    reply = await ask_groq(message.from_user.id, message.text, context)
     await message.answer(reply)
 
+# ── TradingView webhook ───────────────────────────────────────────────────────
 _tv_rate: dict[str, float] = {}
 TV_COOLDOWN = 10
 
@@ -263,9 +363,8 @@ async def tradingview_webhook(request: web.Request) -> web.Response:
     return web.Response(text="OK")
 
 async def on_startup(app: web.Application):
-    webhook_url = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
-    await bot.set_webhook(webhook_url)
-    logger.info("Webhook встановлено: %s", webhook_url)
+    await bot.set_webhook(f"{WEBHOOK_HOST}{WEBHOOK_PATH}")
+    logger.info("Webhook встановлено: %s%s", WEBHOOK_HOST, WEBHOOK_PATH)
 
 async def on_shutdown(app: web.Application):
     await bot.delete_webhook()
