@@ -1,5 +1,3 @@
-bash
-
 rm /mnt/user-data/outputs/bot.py && cat > /mnt/user-data/outputs/bot.py << 'ENDOFFILE'
 import os
 import logging
