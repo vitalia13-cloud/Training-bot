@@ -27,8 +27,8 @@ bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
  
 genai.configure(api_key=GEMINI_API_KEY)
-gemini_model = genai.GenerativeModel("gemini-1.5-flash")
- 
+gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+
 RATE_LIMIT   = 5
 RATE_WINDOW  = 60
 _rate_buckets: dict[int, list[float]] = defaultdict(list)
