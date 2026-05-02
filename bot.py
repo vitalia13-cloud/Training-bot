@@ -545,6 +545,33 @@ async def handle_text(message: Message):
     if is_rate_limited(message.from_user.id):
         await message.answer("⏳ Забагато запитів. Зачекай хвилину.")
         return
+
+    # Розпізнавання тікерів — якщо написали XAU, BTC, EUR і т.д.
+    TICKER_ALIASES = {
+        "XAU": "XAUUSD", "GOLD": "XAUUSD", "ЗОЛОТО": "XAUUSD",
+        "BTC": "BTCUSD", "BITCOIN": "BTCUSD", "БІТКОІН": "BTCUSD",
+        "EUR": "EURUSD", "EURUSD": "EURUSD",
+        "GBP": "GBPUSD", "GBPUSD": "GBPUSD",
+        "AUD": "AUDUSD", "AUDUSD": "AUDUSD",
+        "NZD": "NZDUSD", "NZDUSD": "NZDUSD",
+        "JPY": "USDJPY", "USDJPY": "USDJPY",
+        "EURJPY": "EURJPY", "GBPJPY": "GBPJPY",
+        "NAS": "NAS100", "NAS100": "NAS100", "NASDAQ": "NAS100",
+        "DJ": "US30", "US30": "US30", "DOW": "US30",
+        "DAX": "GER40", "GER40": "GER40", "GER": "GER40",
+    }
+    text_upper = message.text.strip().upper()
+    matched_sym = TICKER_ALIASES.get(text_upper)
+
+    if matched_sym:
+        await message.answer(f"⏳ MTF аналіз {matched_sym}...")
+        mtf = await get_mtf_data(matched_sym)
+        if mtf:
+            await message.answer(format_mtf({matched_sym: mtf}))
+        else:
+            await message.answer(f"❌ Не вдалось отримати дані для {matched_sym}.")
+        return
+
     await message.answer("💭 Думаю...")
     prices, news = await asyncio.gather(get_quick_prices(), get_market_news())
     prices_text = format_prices_context(prices) if prices else ""
