@@ -186,6 +186,250 @@ def format_prices_context(prices: dict) -> str:
         lines.append(f"{sym}: {d.get('price', 'N/A')} {arrow}")
     return "\n".join(lines)
 
+
+def calc_rsi(closes: list, period: int = 14) -> float:
+    """RSI по списку закриттів (найновіший перший)"""
+    if len(closes) < period + 1:
+        return 50.0
+    closes = list(reversed(closes[:period + 5]))  # старіші спочатку
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        diff = closes[i] - closes[i-1]
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 1)
+
+def calc_ema(closes: list, period: int) -> float:
+    """EMA по списку закриттів (найновіший перший)"""
+    if len(closes) < period:
+        return closes[0] if closes else 0
+    data = list(reversed(closes))  # старіші спочатку
+    k = 2 / (period + 1)
+    ema = sum(data[:period]) / period
+    for price in data[period:]:
+        ema = price * k + ema * (1 - k)
+    return round(ema, 6)
+
+def calc_macd(closes: list) -> dict:
+    """MACD (12,26,9) по списку закриттів (найновіший перший)"""
+    if len(closes) < 26:
+        return {"signal": "нейтр", "hist": 0}
+    ema12 = calc_ema(closes, 12)
+    ema26 = calc_ema(closes, 26)
+    macd_line = ema12 - ema26
+    # Спрощений сигнал
+    ema12_prev = calc_ema(closes[1:], 12)
+    ema26_prev = calc_ema(closes[1:], 26)
+    macd_prev = ema12_prev - ema26_prev
+    hist = macd_line - macd_prev
+    if macd_line > 0 and hist > 0:
+        signal = "▲ бичачий"
+    elif macd_line < 0 and hist < 0:
+        signal = "▼ ведмежий"
+    elif hist > 0:
+        signal = "↗ розворот вгору"
+    else:
+        signal = "↘ розворот вниз"
+    return {"signal": signal, "hist": round(hist, 6), "line": round(macd_line, 6)}
+
+def calc_indicators(closes: list, sym: str) -> dict:
+    """Розраховує всі індикатори"""
+    rsi = calc_rsi(closes)
+    ema20 = calc_ema(closes, 20)
+    ema50 = calc_ema(closes, 50) if len(closes) >= 50 else None
+    macd = calc_macd(closes)
+    current = closes[0]
+
+    # RSI зона
+    if rsi >= 70:
+        rsi_zone = "перекупленість ⚠️"
+    elif rsi <= 30:
+        rsi_zone = "перепроданість ⚠️"
+    elif rsi >= 55:
+        rsi_zone = "бичача зона"
+    elif rsi <= 45:
+        rsi_zone = "ведмежа зона"
+    else:
+        rsi_zone = "нейтральна"
+
+    # EMA тренд
+    ema_trend = None
+    if ema50:
+        ema_trend = "EMA20>EMA50 ✅" if ema20 > ema50 else "EMA20<EMA50 ❌"
+
+    # Підтвердження сигналу індикаторами
+    bull_signals = 0
+    bear_signals = 0
+    if rsi > 50: bull_signals += 1
+    else: bear_signals += 1
+    if "бичач" in macd["signal"] or "вгору" in macd["signal"]: bull_signals += 1
+    else: bear_signals += 1
+    if ema50 and ema20 > ema50: bull_signals += 1
+    elif ema50: bear_signals += 1
+
+    return {
+        "rsi": rsi,
+        "rsi_zone": rsi_zone,
+        "macd": macd["signal"],
+        "ema20": ema20,
+        "ema50": ema50,
+        "ema_trend": ema_trend,
+        "bull_signals": bull_signals,
+        "bear_signals": bear_signals,
+    }
+
+def calc_bollinger(closes: list, period: int = 20) -> dict:
+    """Bollinger Bands"""
+    if len(closes) < period:
+        return {}
+    data = list(reversed(closes[:period]))
+    sma = sum(data) / period
+    std = (sum((x - sma) ** 2 for x in data) / period) ** 0.5
+    upper = sma + 2 * std
+    lower = sma - 2 * std
+    current = closes[0]
+    width = (upper - lower) / sma * 100
+    if current > upper:
+        position = "вище верхньої ⚠️"
+    elif current < lower:
+        position = "нижче нижньої ⚠️"
+    elif current > sma:
+        position = "вище середньої"
+    else:
+        position = "нижче середньої"
+    return {
+        "upper": round(upper, 6),
+        "lower": round(lower, 6),
+        "sma":   round(sma, 6),
+        "width": round(width, 2),
+        "position": position,
+    }
+
+def calc_stoch_rsi(closes: list, rsi_period: int = 14, stoch_period: int = 14) -> float:
+    """Stochastic RSI"""
+    if len(closes) < rsi_period + stoch_period:
+        return 50.0
+    # Рахуємо RSI для кожної точки
+    rsi_values = []
+    for i in range(stoch_period):
+        rsi_val = calc_rsi(closes[i:], rsi_period)
+        rsi_values.append(rsi_val)
+    min_rsi = min(rsi_values)
+    max_rsi = max(rsi_values)
+    if max_rsi == min_rsi:
+        return 50.0
+    stoch_rsi = (rsi_values[0] - min_rsi) / (max_rsi - min_rsi) * 100
+    return round(stoch_rsi, 1)
+
+def calc_fibonacci(highs: list, lows: list) -> dict:
+    """Рівні Fibonacci по останніх 20 барах"""
+    if not highs or not lows:
+        return {}
+    high = max(highs)
+    low  = min(lows)
+    diff = high - low
+    return {
+        "0.236": round(high - diff * 0.236, 6),
+        "0.382": round(high - diff * 0.382, 6),
+        "0.500": round(high - diff * 0.500, 6),
+        "0.618": round(high - diff * 0.618, 6),
+        "0.786": round(high - diff * 0.786, 6),
+    }
+
+def detect_candle_pattern(candles: list) -> str:
+    """Визначає свічковий патерн по останніх 3 свічках"""
+    if len(candles) < 3:
+        return ""
+    c0 = candles[0]  # поточна
+    c1 = candles[1]  # попередня
+    c2 = candles[2]  # позапопередня
+
+    o0, h0, l0, c_0 = float(c0["open"]), float(c0["high"]), float(c0["low"]), float(c0["close"])
+    o1, h1, l1, c_1 = float(c1["open"]), float(c1["high"]), float(c1["low"]), float(c1["close"])
+    o2, h2, l2, c_2 = float(c2["open"]), float(c2["high"]), float(c2["low"]), float(c2["close"])
+
+    body0 = abs(c_0 - o0)
+    body1 = abs(c_1 - o1)
+    range0 = h0 - l0
+    range1 = h1 - l1
+
+    # Doji
+    if range0 > 0 and body0 / range0 < 0.1:
+        return "🕯 Doji (невизначеність)"
+
+    # Hammer (бичачий розворот)
+    lower_wick0 = min(o0, c_0) - l0
+    upper_wick0 = h0 - max(o0, c_0)
+    if lower_wick0 > body0 * 2 and upper_wick0 < body0 * 0.5 and c_1 < o1:
+        return "🔨 Hammer (бичачий розворот)"
+
+    # Shooting Star (ведмежий розворот)
+    if upper_wick0 > body0 * 2 and lower_wick0 < body0 * 0.5 and c_1 > o1:
+        return "💫 Shooting Star (ведмежий розворот)"
+
+    # Bullish Engulfing
+    if c_1 < o1 and c_0 > o0 and o0 < c_1 and c_0 > o1:
+        return "🟢 Bullish Engulfing (бичаче поглинання)"
+
+    # Bearish Engulfing
+    if c_1 > o1 and c_0 < o0 and o0 > c_1 and c_0 < o1:
+        return "🔴 Bearish Engulfing (ведмеже поглинання)"
+
+    # Morning Star
+    if c_2 < o2 and body1 < body0 * 0.3 and c_0 > o0 and c_0 > (o2 + c_2) / 2:
+        return "⭐ Morning Star (бичачий розворот)"
+
+    # Evening Star
+    if c_2 > o2 and body1 < body0 * 0.3 and c_0 < o0 and c_0 < (o2 + c_2) / 2:
+        return "🌙 Evening Star (ведмежий розворот)"
+
+    # Three White Soldiers
+    if all([
+        float(candles[i]["close"]) > float(candles[i]["open"]) for i in range(3)
+    ]) and c_0 > c_1 > c_2:
+        return "🪖 Three White Soldiers (сильний бичачий)"
+
+    # Three Black Crows
+    if all([
+        float(candles[i]["close"]) < float(candles[i]["open"]) for i in range(3)
+    ]) and c_0 < c_1 < c_2:
+        return "🐦 Three Black Crows (сильний ведмежий)"
+
+    return ""
+
+
+
+async def get_fear_greed() -> dict:
+    """Fear & Greed Index для крипто (безкоштовно)"""
+    try:
+        async with aiohttp_client.ClientSession() as session:
+            async with session.get(
+                "https://api.alternative.me/fng/?limit=1",
+                timeout=aiohttp_client.ClientTimeout(total=5)
+            ) as resp:
+                data = await resp.json()
+                item = data.get("data", [{}])[0]
+                value = int(item.get("value", 50))
+                label = item.get("value_classification", "Neutral")
+                if value <= 25:
+                    emoji = "😱"
+                elif value <= 45:
+                    emoji = "😰"
+                elif value <= 55:
+                    emoji = "😐"
+                elif value <= 75:
+                    emoji = "😊"
+                else:
+                    emoji = "🤑"
+                return {"value": value, "label": label, "emoji": emoji}
+    except Exception:
+        return {}
+
 # Polygon тікери для крипто (реальний час)
 POLYGON_CRYPTO = {
     "BTCUSD": "X:BTCUSD",
@@ -279,7 +523,7 @@ async def get_mtf_data(symbol: str) -> dict:
     for tf, label in timeframes.items():
         url = (
             f"https://api.twelvedata.com/time_series?"
-            f"symbol={td_sym}&interval={tf}&outputsize=20&apikey={TWELVE_API_KEY}"
+            f"symbol={td_sym}&interval={tf}&outputsize=60&apikey={TWELVE_API_KEY}"
         )
         try:
             async with aiohttp_client.ClientSession() as session:
@@ -295,6 +539,9 @@ async def get_mtf_data(symbol: str) -> dict:
                         low    = float(curr["low"])
                         prev_close = float(prev["close"])
 
+                        # Список закриттів для індикаторів (найновіший перший)
+                        closes = [float(v["close"]) for v in values]
+
                         # ATR
                         atr = sum(float(b["high"]) - float(b["low"]) for b in values[:5]) / 5
 
@@ -304,12 +551,39 @@ async def get_mtf_data(symbol: str) -> dict:
                         resistance = recent_highs[0]
                         support    = recent_lows[0]
 
-                        if close > open_ and close > prev_close:
+                        # Індикатори
+                        ind = calc_indicators(closes, symbol)
+
+                        # Напрямок з урахуванням індикаторів
+                        bull = 0
+                        bear = 0
+                        if close > open_ and close > prev_close: bull += 2
+                        elif close < open_ and close < prev_close: bear += 2
+                        bull += ind["bull_signals"]
+                        bear += ind["bear_signals"]
+
+                        if bull > bear + 1:
                             trend, direction = "📈", "ЛОНГ"
-                        elif close < open_ and close < prev_close:
+                        elif bear > bull + 1:
                             trend, direction = "📉", "ШОРТ"
                         else:
                             trend, direction = "➡️", "НЕЙТР"
+
+                        # Нові індикатори
+                        highs_list = [float(v["high"]) for v in values[:20]]
+                        lows_list  = [float(v["low"])  for v in values[:20]]
+                        bb     = calc_bollinger(closes)
+                        stoch  = calc_stoch_rsi(closes)
+                        fibs   = calc_fibonacci(highs_list, lows_list)
+                        pattern = detect_candle_pattern(values[:3])
+
+                        # Stoch RSI зона
+                        if stoch >= 80:
+                            stoch_zone = "перекупленість ⚠️"
+                        elif stoch <= 20:
+                            stoch_zone = "перепроданість ⚠️"
+                        else:
+                            stoch_zone = f"{stoch}"
 
                         result[label] = {
                             "price":      close,
@@ -322,6 +596,14 @@ async def get_mtf_data(symbol: str) -> dict:
                             "support":    support,
                             "resistance": resistance,
                             "source":     "🕐15хв",
+                            "rsi":        ind["rsi"],
+                            "rsi_zone":   ind["rsi_zone"],
+                            "macd":       ind["macd"],
+                            "ema_trend":  ind["ema_trend"],
+                            "bb":         bb,
+                            "stoch_rsi":  stoch_zone,
+                            "fibs":       fibs,
+                            "pattern":    pattern,
                         }
         except Exception:
             logger.warning("MTF помилка %s %s", symbol, tf)
@@ -413,6 +695,42 @@ def format_mtf(mtf_data: dict) -> str:
             overall = "ШОРТ"
         else:
             overall = "НЕЙТР"
+
+        # Індикатори з найкращого таймфрейму (1H або 4H)
+        rsi       = best_tf.get("rsi")
+        rsi_zone  = best_tf.get("rsi_zone", "")
+        macd_sig  = best_tf.get("macd", "")
+        ema_trend = best_tf.get("ema_trend", "")
+        stoch     = best_tf.get("stoch_rsi", "")
+        bb        = best_tf.get("bb", {})
+        pattern   = best_tf.get("pattern", "")
+        fibs      = best_tf.get("fibs", {})
+
+        # Рядок індикаторів
+        ind_parts = []
+        if rsi: ind_parts.append(f"RSI {rsi} {rsi_zone}")
+        if stoch and stoch != "50.0": ind_parts.append(f"StochRSI {stoch}")
+        if macd_sig: ind_parts.append(f"MACD {macd_sig}")
+        if ema_trend: ind_parts.append(ema_trend)
+        if ind_parts:
+            lines.append(f"  📊 {' │ '.join(ind_parts)}")
+
+        # Bollinger Bands
+        if bb.get("position"):
+            bb_width = f" (шир. {bb['width']}%)" if bb.get("width") else ""
+            lines.append(f"  📐 BB: {bb['position']}{bb_width}")
+
+        # Свічковий патерн
+        if pattern:
+            lines.append(f"  🕯 {pattern}")
+
+        # Ключові рівні Fib (найближчі до ціни)
+        if fibs and best_tf.get("price"):
+            price = best_tf["price"]
+            fib_levels = sorted(fibs.items(), key=lambda x: abs(float(x[1]) - price))[:2]
+            fib_str = "  ".join(f"Fib{k}: {smart_price(sym, v)}" for k, v in fib_levels)
+            if fib_str:
+                lines.append(f"  🌀 {fib_str}")
 
         if overall != "НЕЙТР" and "atr" in best_tf:
             levels = calc_levels(
@@ -520,11 +838,15 @@ async def cmd_mtf(message: Message):
     if not is_allowed(message):
         return
     await message.answer("⏳ Завантажую MTF аналіз...")
-    mtf_data = await get_all_mtf()
+    mtf_data, fg = await asyncio.gather(get_all_mtf(), get_fear_greed())
     if not mtf_data:
         await message.answer("❌ Не вдалось отримати дані.")
         return
-    await message.answer(format_mtf(mtf_data))
+    result = format_mtf(mtf_data)
+    if fg:
+        fg_line = f"\n😨 Fear & Greed: {fg['emoji']} {fg['value']}/100 ({fg['label']})"
+        result = result.replace("🟢 ЛОНГ  🔴 ШОРТ", fg_line + "\n🟢 ЛОНГ  🔴 ШОРТ")
+    await message.answer(result)
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
@@ -668,9 +990,16 @@ async def handle_text(message: Message):
 
     if matched_sym:
         await message.answer(f"⏳ MTF аналіз {matched_sym}...")
-        mtf = await get_mtf_data(matched_sym)
+        mtf, fg = await asyncio.gather(
+            get_mtf_data(matched_sym),
+            get_fear_greed() if matched_sym == "BTCUSD" else asyncio.coroutine(lambda: {})()
+        )
         if mtf:
-            await message.answer(format_mtf({matched_sym: mtf}))
+            result = format_mtf({matched_sym: mtf})
+            if fg and matched_sym == "BTCUSD":
+                fg_line = f"\n😨 Fear & Greed: {fg['emoji']} {fg['value']}/100 ({fg['label']})"
+                result += fg_line
+            await message.answer(result)
         else:
             await message.answer(f"❌ Не вдалось отримати дані для {matched_sym}.")
         return
