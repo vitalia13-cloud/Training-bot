@@ -1,6 +1,8 @@
+
 import os
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -25,6 +27,11 @@ ALLOWED_CHATS    = {c.strip() for c in os.getenv("ALLOWED_CHATS", "").split(",")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+TZ = ZoneInfo("Europe/Copenhagen")
+
+def now_local() -> str:
+    return datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
 
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
@@ -510,7 +517,7 @@ async def get_polygon_mtf(symbol: str) -> dict:
                         }
         except Exception:
             logger.warning("Polygon MTF помилка %s %s", symbol, tf_label)
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(1.5)
     return result
 
 async def get_mtf_data(symbol: str) -> dict:
@@ -658,7 +665,7 @@ def format_mtf(mtf_data: dict) -> str:
     }
     SIGNAL_ICONS = {"ЛОНГ": "🟢", "ШОРТ": "🔴", "НЕЙТР": "⚪"}
     lines = []
-    ts = datetime.now().strftime("%d.%m.%Y %H:%M")
+    ts = now_local()
     lines.append(f"📊 MTF — {ts}")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━")
 
@@ -782,54 +789,197 @@ async def ask_groq(user_id: int, user_message: str, extra_context: str = "") -> 
         logger.exception("Groq помилка")
         return "❌ Помилка запиту. Спробуй ще раз."
 
+def calc_signal_score(tfs: dict) -> int:
+    """Розраховує % ймовірності відпрацювання сигналу (0-100)"""
+    score = 0
+    available = [tf for tf in ["1D", "4H", "1H"] if tf in tfs]
+    if not available:
+        return 0
+
+    best = tfs.get("1H") or tfs.get("4H") or tfs.get("1D")
+    directions = [tfs[tf]["direction"] for tf in available]
+    long_count  = directions.count("ЛОНГ")
+    short_count = directions.count("ШОРТ")
+
+    # MTF збіг (до 30 балів)
+    if long_count == 3 or short_count == 3:
+        score += 30  # всі 3 таймфрейми збігаються
+    elif long_count == 2 or short_count == 2:
+        score += 18
+
+    # RSI не в екстремальній зоні (до 15 балів)
+    rsi = best.get("rsi", 50)
+    if 40 <= rsi <= 60:
+        score += 15
+    elif 35 <= rsi <= 65:
+        score += 10
+    elif rsi > 70 or rsi < 30:
+        score -= 10  # перекупленість/перепроданість — ризик
+
+    # MACD підтверджує (до 15 балів)
+    macd = best.get("macd", "")
+    if "бичачий" in macd or "вгору" in macd:
+        if long_count >= 2: score += 15
+    elif "ведмежий" in macd or "вниз" in macd:
+        if short_count >= 2: score += 15
+
+    # EMA тренд збігається (до 10 балів)
+    ema = best.get("ema_trend", "")
+    if "✅" in ema and long_count >= 2: score += 10
+    elif "❌" in ema and short_count >= 2: score += 10
+
+    # Bollinger Bands (до 10 балів)
+    bb = best.get("bb", {})
+    bb_pos = bb.get("position", "")
+    if "середньої" in bb_pos and ("вище" in bb_pos and long_count >= 2):
+        score += 10
+    elif "середньої" in bb_pos and ("нижче" in bb_pos and short_count >= 2):
+        score += 10
+
+    # Свічковий патерн (до 10 балів)
+    pattern = best.get("pattern", "")
+    if pattern:
+        if ("бичачий" in pattern and long_count >= 2) or            ("ведмежий" in pattern and short_count >= 2):
+            score += 10
+
+    # StochRSI (до 10 балів)
+    stoch_str = str(best.get("stoch_rsi", "50"))
+    try:
+        stoch_val = float(stoch_str.replace("перекупленість ⚠️", "85").replace("перепроданість ⚠️", "15"))
+        if 30 <= stoch_val <= 70:
+            score += 10
+    except:
+        pass
+
+    return min(max(score, 0), 100)
+
+def format_session_mtf(mtf_data: dict, top_n: int = 3) -> str:
+    """Форматує сесійний аналіз з ранжуванням по % відпрацювання"""
+    ASSET_FLAGS = {
+        "EURUSD": "🇪🇺", "GBPUSD": "🇬🇧", "AUDUSD": "🇦🇺", "NZDUSD": "🇳🇿",
+        "USDJPY": "🇯🇵", "EURJPY": "🔀", "GBPJPY": "🔀",
+        "XAUUSD": "🥇", "BTCUSD": "₿", "GER40": "🇩🇪", "NAS100": "💻", "US30": "🏦",
+    }
+    SIGNAL_ICONS = {"ЛОНГ": "🟢", "ШОРТ": "🔴", "НЕЙТР": "⚪"}
+
+    # Рахуємо скори для всіх активів
+    scored = []
+    for sym, tfs in mtf_data.items():
+        score = calc_signal_score(tfs)
+        available = [tf for tf in ["1D", "4H", "1H"] if tf in tfs]
+        if not available:
+            continue
+        directions = [tfs[tf]["direction"] for tf in available]
+        long_count  = directions.count("ЛОНГ")
+        short_count = directions.count("ШОРТ")
+        if long_count >= 2:
+            overall = "ЛОНГ"
+        elif short_count >= 2:
+            overall = "ШОРТ"
+        else:
+            overall = "НЕЙТР"
+        scored.append((sym, tfs, score, overall))
+
+    # Сортуємо по скору, беремо топ без НЕЙТР
+    scored.sort(key=lambda x: x[2], reverse=True)
+    top = [x for x in scored if x[3] != "НЕЙТР"][:top_n]
+
+    lines = []
+    for i, (sym, tfs, score, overall) in enumerate(top, 1):
+        flag = ASSET_FLAGS.get(sym, "")
+        best = tfs.get("1H") or tfs.get("4H") or tfs.get("1D")
+        price_str = smart_price(sym, best["price"])
+        icon = SIGNAL_ICONS[overall]
+
+        # Рівні
+        levels = {}
+        if "atr" in best:
+            levels = calc_levels(
+                sym, overall, best["price"], best["atr"],
+                best.get("support", best["price"] * 0.99),
+                best.get("resistance", best["price"] * 1.01),
+            )
+
+        lines.append(f"{'🥇' if i==1 else '🥈' if i==2 else '🥉'} #{i} {flag} {sym}  {price_str}")
+        lines.append(f"  {icon} {overall}  📊 Ймовірність: {score}%")
+
+        # Таймфрейми
+        row = []
+        for tf_label in ["1D", "4H", "1H"]:
+            if tf_label in tfs:
+                d = tfs[tf_label]
+                row.append(f"{tf_label}{SIGNAL_ICONS.get(d['direction'], '⚪')}")
+        lines.append(f"  {'  '.join(row)}")
+
+        # Індикатори
+        rsi = best.get("rsi")
+        macd = best.get("macd", "")
+        pattern = best.get("pattern", "")
+        if rsi: lines.append(f"  RSI {rsi} │ MACD {macd}")
+        if pattern: lines.append(f"  {pattern}")
+
+        # Рівні входу
+        if levels:
+            lines.append(f"  🎯 Вхід: {smart_price(sym, levels['entry'])}")
+            lines.append(f"  🛑 Стоп: {smart_price(sym, levels['stop'])}")
+            lines.append(f"  💰 Тейк: {smart_price(sym, levels['target'])}")
+            lines.append(f"  ⚖️ R/R: 1:{levels['rr']}")
+        lines.append("")
+
+    return "\n".join(lines)
+
 async def send_session_report(session: str):
     session_name = SESSION_NAMES.get(session, session.upper())
-    ts = datetime.now().strftime("%d.%m.%Y %H:%M")
+    ts = now_local()
     for chat_id in ALLOWED_CHATS:
         try:
             await bot.send_message(chat_id, f"⏳ Готую аналіз для {session_name}...")
         except Exception:
             pass
-    prices, news = await asyncio.gather(get_all_quotes(), get_market_news())
-    prices_pretty  = format_prices_pretty(prices)
-    prices_context = format_prices_context(prices)
-    news_text      = format_news(news)
-    prompt = (
-        f"Починається {session_name} ({ts}).\n\n"
-        f"Реальні ціни:\n{prices_context}\n\n"
-        f"Останні новини:\n{news_text}\n\n"
-        "Зроби повний аналіз для інтрадей:\n"
-        "1. 🌍 Загальний настрій ринку\n"
-        "2. 🏆 Топ-3 найкращі можливості\n"
-        "3. Для кожного активу:\n"
-        "   📈 ЛОНГ або 📉 ШОРТ\n"
-        "   🎯 Вхід: [ціна]\n"
-        "   🛑 Стоп-лос: [ціна]\n"
-        "   💰 Тейк-профіт: [ціна]\n"
-        "   📰 Вплив новин\n"
-        "4. ⚡ Ключові ризики на сьогодні"
+
+    # Збираємо всі дані паралельно
+    mtf_data, news, fg = await asyncio.gather(
+        get_all_mtf(),
+        get_market_news(),
+        get_fear_greed(),
     )
-    try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
-            max_tokens=1500,
-        )
-        analysis = response.choices[0].message.content
-        report = (
-            f"📊 АНАЛІЗ — {session_name}\n"
-            f"🕐 {ts}\n"
-            f"{prices_pretty}\n\n"
-            f"📰 Новини:\n{news_text}\n\n"
-            f"{analysis}"
-        )
-        for chat_id in ALLOWED_CHATS:
-            try:
-                await bot.send_message(chat_id, report)
-            except Exception:
-                logger.exception("Помилка надсилання %s", chat_id)
-    except Exception:
-        logger.exception("Помилка звіту")
+
+    news_text = format_news(news)
+    session_analysis = format_session_mtf(mtf_data, top_n=3)
+
+    # Заголовок
+    header = (
+        f"📊 АНАЛІЗ ПЕРЕД СЕСІЄЮ\n"
+        f"{session_name}\n"
+        f"🕐 {ts}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🏆 ТОП-3 УГОДИ\n"
+        f"(відсортовано по % відпрацювання)\n\n"
+    )
+
+    # Fear & Greed для BTC
+    fg_line = ""
+    if fg:
+        fg_line = f"\n😨 Fear & Greed: {fg['emoji']} {fg['value']}/100 ({fg['label']})"
+
+    # Новини коротко
+    news_short = "\n".join(news[:3]) if news else ""
+
+    report = (
+        f"{header}"
+        f"{session_analysis}"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📰 Ключові новини:\n{news_short}"
+        f"{fg_line}\n\n"
+        f"⚠️ Це не фінансова порада."
+    )
+
+    for chat_id in ALLOWED_CHATS:
+        try:
+            await bot.send_message(chat_id, report)
+        except Exception:
+            logger.exception("Помилка надсилання %s", chat_id)
+
     _session_buffer.pop(session, None)
     _session_timers.pop(session, None)
 
@@ -876,7 +1026,7 @@ async def cmd_prices(message: Message):
     if not prices:
         await message.answer("❌ Не вдалось отримати ціни.")
         return
-    ts = datetime.now().strftime("%d.%m.%Y %H:%M")
+    ts = now_local()
     await message.answer(f"📈 Ринок — {ts}\n{format_prices_pretty(prices)}")
 
 @dp.message(Command("news"))
@@ -888,7 +1038,7 @@ async def cmd_news(message: Message):
     if not news:
         await message.answer("❌ Новини недоступні.")
         return
-    ts = datetime.now().strftime("%d.%m.%Y %H:%M")
+    ts = now_local()
     await message.answer(f"📰 Новини — {ts}\n\n{format_news(news)}")
 
 @dp.message(Command("analyze"))
@@ -899,7 +1049,7 @@ async def cmd_analyze(message: Message):
     prices, news = await asyncio.gather(get_all_quotes(), get_market_news())
     prices_context = format_prices_context(prices) if prices else "недоступно"
     news_text      = format_news(news)
-    ts = datetime.now().strftime("%d.%m.%Y %H:%M")
+    ts = now_local()
     prompt = (
         f"Реальні ціни на {ts}:\n{prices_context}\n\n"
         f"Останні новини:\n{news_text}\n\n"
@@ -1048,7 +1198,7 @@ async def tradingview_webhook(request: web.Request) -> web.Response:
         return web.Response(text="OK")
     _tv_rate[key] = now
     action_text = "📈 ЛОНГ" if action == "BUY" else "📉 ШОРТ" if action == "SELL" else action
-    ts = datetime.now().strftime("%d.%m.%Y %H:%M")
+    ts = now_local()
     signal = (
         f"🔔 СИГНАЛ — {ts}\n\n"
         f"{symbol}\n{action_text}\n"
