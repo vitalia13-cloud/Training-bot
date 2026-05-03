@@ -1,4 +1,3 @@
-
 import os
 import logging
 from datetime import datetime
@@ -1140,15 +1139,13 @@ async def handle_text(message: Message):
 
     if matched_sym:
         await message.answer(f"⏳ MTF аналіз {matched_sym}...")
-        mtf, fg = await asyncio.gather(
-            get_mtf_data(matched_sym),
-            get_fear_greed() if matched_sym == "BTCUSD" else asyncio.coroutine(lambda: {})()
-        )
+        mtf = await get_mtf_data(matched_sym)
         if mtf:
             result = format_mtf({matched_sym: mtf})
-            if fg and matched_sym == "BTCUSD":
-                fg_line = f"\n😨 Fear & Greed: {fg['emoji']} {fg['value']}/100 ({fg['label']})"
-                result += fg_line
+            if matched_sym == "BTCUSD":
+                fg = await get_fear_greed()
+                if fg:
+                    result += f"\n😨 Fear & Greed: {fg['emoji']} {fg['value']}/100 ({fg['label']})"
             await message.answer(result)
         else:
             await message.answer(f"❌ Не вдалось отримати дані для {matched_sym}.")
