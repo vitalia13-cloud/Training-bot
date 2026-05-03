@@ -638,22 +638,33 @@ def smart_price(sym: str, price: float) -> str:
         return f"{price:.5f}"
 
 def calc_levels(sym: str, direction: str, price: float, atr: float, support: float, resistance: float) -> dict:
-    """Розраховує вхід, стоп і тейк на основі ATR і рівнів"""
+    """Розраховує вхід, стоп і тейк з фіксованим R/R 1:2"""
     if direction == "ЛОНГ":
-        entry  = price
-        stop   = max(price - atr * 1.2, support - atr * 0.3)
-        target = min(price + atr * 2.0, resistance + atr * 0.3)
+        entry = price
+        # Стоп — за рівнем підтримки або ATR, беремо менший ризик
+        stop_atr     = price - atr * 1.0
+        stop_support = support - atr * 0.2
+        stop  = max(stop_atr, stop_support)  # вищий стоп = менший ризик
+        risk  = abs(entry - stop)
+        if risk == 0:
+            return {}
+        target = entry + risk * 2.0  # завжди R/R 1:2
     elif direction == "ШОРТ":
-        entry  = price
-        stop   = min(price + atr * 1.2, resistance + atr * 0.3)
-        target = max(price - atr * 2.0, support - atr * 0.3)
+        entry = price
+        stop_atr        = price + atr * 1.0
+        stop_resistance = resistance + atr * 0.2
+        stop  = min(stop_atr, stop_resistance)  # нижчий стоп = менший ризик
+        risk  = abs(entry - stop)
+        if risk == 0:
+            return {}
+        target = entry - risk * 2.0  # завжди R/R 1:2
     else:
         return {}
     return {
         "entry":  entry,
         "stop":   stop,
         "target": target,
-        "rr":     round(abs(target - entry) / abs(stop - entry), 1) if abs(stop - entry) > 0 else 0,
+        "rr":     2.0,
     }
 
 def format_mtf(mtf_data: dict) -> str:
